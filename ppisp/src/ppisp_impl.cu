@@ -20,7 +20,7 @@
 
 #include <algorithm>
 
-#include <cub/cub.cuh>
+#include <cub/block/block_reduce.cuh>
 
 #include "ppisp_constants.h"
 #include "ppisp_math.cuh"

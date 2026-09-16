@@ -22,6 +22,9 @@
 
 #include <cub/cub.cuh>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
 #include "ppisp_constants.h"
 #include "ppisp_math.cuh"
 #include "ppisp_math_bwd.cuh"
@@ -339,10 +342,12 @@ void ppisp_forward(const float *exposure_params, const float *vignetting_params,
                    float *rgb_out, const float *pixel_coords, int num_pixels, int num_cameras,
                    int num_frames, int resolution_w, int resolution_h, int camera_idx,
                    int frame_idx) {
+    if (num_pixels == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
     const int blocks = divUp(num_pixels, threads);
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
-    ppisp_kernel<<<blocks, threads>>>(
+    ppisp_kernel<<<blocks, threads, 0, stream>>>(
         num_pixels, num_cameras, num_frames, exposure_params,
         reinterpret_cast<const VignettingChannelParams *>(vignetting_params),
         reinterpret_cast<const ColorPPISPParams *>(color_params),
@@ -350,12 +355,7 @@ void ppisp_forward(const float *exposure_params, const float *vignetting_params,
         reinterpret_cast<const float3 *>(rgb_in), reinterpret_cast<float3 *>(rgb_out),
         reinterpret_cast<const float2 *>(pixel_coords), resolution_w, resolution_h, camera_idx,
         frame_idx);
-
-    // Check for errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error in ppisp_forward: %s\n", cudaGetErrorString(err));
-    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ============================================================================
@@ -369,10 +369,12 @@ void ppisp_backward(const float *exposure_params, const float *vignetting_params
                     float *v_crf_params, float *v_rgb_in, int num_pixels, int num_cameras,
                     int num_frames, int resolution_w, int resolution_h, int camera_idx,
                     int frame_idx) {
+    if (num_pixels == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
     const int blocks = divUp(num_pixels, threads);
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
-    ppisp_bwd_kernel<PPISP_BLOCK_SIZE><<<blocks, threads>>>(
+    ppisp_bwd_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(
         num_pixels, num_cameras, num_frames, exposure_params,
         reinterpret_cast<const VignettingChannelParams *>(vignetting_params),
         reinterpret_cast<const ColorPPISPParams *>(color_params),
@@ -384,12 +386,7 @@ void ppisp_backward(const float *exposure_params, const float *vignetting_params
         reinterpret_cast<CRFPPISPChannelParams *>(v_crf_params),
         reinterpret_cast<float3 *>(v_rgb_in), reinterpret_cast<const float2 *>(pixel_coords),
         resolution_w, resolution_h, camera_idx, frame_idx);
-
-    // Check for errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error in ppisp_backward: %s\n", cudaGetErrorString(err));
-    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ============================================================================
@@ -755,14 +752,15 @@ void ppisp_regularization_forward(
     float vig_channel_weight, float vig_non_pos_weight, float color_mean_weight,
     float crf_channel_weight) {
     const int threads = PPISP_BLOCK_SIZE;
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
     if (num_frames > 0 && (exposure_mean_weight > 0.0f || color_mean_weight > 0.0f)) {
         int blocks = divUp(num_frames, threads);
-        ppisp_regularization_frame_mean_sums_kernel<PPISP_BLOCK_SIZE><<<blocks, threads>>>(
+        ppisp_regularization_frame_mean_sums_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(
             exposure_params, reinterpret_cast<const ColorPPISPParams *>(color_params),
             frame_mean_sums,
             num_frames, exposure_mean_weight > 0.0f, color_mean_weight > 0.0f);
-        ppisp_regularization_frame_mean_loss_kernel<<<1, 1>>>(
+        ppisp_regularization_frame_mean_loss_kernel<<<1, 1, 0, stream>>>(
             loss_out, frame_mean_sums, num_frames, exposure_mean_weight, color_mean_weight);
     }
 
@@ -774,15 +772,12 @@ void ppisp_regularization_forward(
         int total_crf_channel = num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL;
         int blocks = divUp(std::max(total_vig, std::max(total_vig_channel, total_crf_channel)),
                            threads);
-        ppisp_regularization_camera_param_loss_kernel<PPISP_BLOCK_SIZE><<<blocks, threads>>>(
+        ppisp_regularization_camera_param_loss_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(
             vignetting_params, crf_params, loss_out, num_cameras, vig_center_weight,
             vig_channel_weight, vig_non_pos_weight, crf_channel_weight);
     }
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error in ppisp_regularization_forward: %s\n", cudaGetErrorString(err));
-    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Inputs:
@@ -807,10 +802,11 @@ void ppisp_regularization_backward(
     float vig_center_weight, float vig_channel_weight, float vig_non_pos_weight,
     float color_mean_weight, float crf_channel_weight) {
     const int threads = PPISP_BLOCK_SIZE;
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
     if (num_frames > 0 && (exposure_mean_weight > 0.0f || color_mean_weight > 0.0f)) {
         int blocks = divUp(num_frames, threads);
-        ppisp_regularization_frame_mean_backward_kernel<<<blocks, threads>>>(
+        ppisp_regularization_frame_mean_backward_kernel<<<blocks, threads, 0, stream>>>(
             frame_mean_sums, grad_loss, grad_exposure_params, grad_color_params, num_frames,
             exposure_mean_weight, color_mean_weight);
     }
@@ -819,7 +815,7 @@ void ppisp_regularization_backward(
         (vig_center_weight > 0.0f || vig_channel_weight > 0.0f || vig_non_pos_weight > 0.0f)) {
         int total_vig = num_cameras * PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
         int blocks = divUp(total_vig, threads);
-        ppisp_regularization_vignetting_backward_kernel<<<blocks, threads>>>(
+        ppisp_regularization_vignetting_backward_kernel<<<blocks, threads, 0, stream>>>(
             vignetting_params, grad_loss, grad_vignetting_params, num_cameras, vig_center_weight,
             vig_channel_weight, vig_non_pos_weight);
     }
@@ -827,12 +823,9 @@ void ppisp_regularization_backward(
     if (num_cameras > 0 && crf_channel_weight > 0.0f) {
         int total_crf = num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL;
         int blocks = divUp(total_crf, threads);
-        ppisp_regularization_crf_backward_kernel<<<blocks, threads>>>(
+        ppisp_regularization_crf_backward_kernel<<<blocks, threads, 0, stream>>>(
             crf_params, grad_loss, grad_crf_params, num_cameras, crf_channel_weight);
     }
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error in ppisp_regularization_backward: %s\n", cudaGetErrorString(err));
-    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

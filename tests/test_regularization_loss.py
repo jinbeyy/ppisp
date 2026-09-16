@@ -661,3 +661,27 @@ def test_regularization_loss_tiny_finite_difference_gradients():
         finite_diff = _central_difference(module, name, index)
         analytic = getattr(module, name).grad[index].item()
         assert analytic == pytest.approx(finite_diff, abs=5e-3, rel=5e-2)
+
+
+def test_regularization_obeys_non_default_stream():
+    module = _make_module(seed=701, num_cameras=8, num_frames=257)
+    reference = _make_module(seed=702, num_cameras=8, num_frames=257)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Keep the producer pending so a default-stream launch cannot pass by luck.
+        torch.cuda._sleep(2_000_000)
+        with torch.no_grad():
+            module.exposure_params.add_(0.13)
+            module.color_params.add_(0.02)
+        loss = module.get_regularization_loss()
+        (loss * 3.25).backward()
+        observed = loss.clone()
+        observed_grads = [p.grad.clone() for p in module.parameters()]
+    stream.synchronize()
+    _clone_params(module, reference)
+    expected = _regularization_loss_torch(reference)
+    (expected * 3.25).backward()
+    torch.testing.assert_close(observed, expected, atol=2e-5, rtol=1e-5)
+    for actual, parameter in zip(observed_grads, reference.parameters()):
+        torch.testing.assert_close(actual, parameter.grad, atol=1e-5, rtol=1e-4)

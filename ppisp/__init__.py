@@ -259,8 +259,26 @@ class _PPISPFunction(torch.autograd.Function):
         )
 
 
+def _as_float_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    """Return ``tensor`` unchanged when it is already float32 and contiguous.
+
+    The dtype and layout checks are plain attribute reads; ``.float()`` and
+    ``.contiguous()`` each go through the dispatcher even when they return the
+    input, and the PPISP parameters are float32 and contiguous by construction.
+    """
+    if tensor.dtype is torch.float32 and tensor.is_contiguous():
+        return tensor
+    return tensor.float().contiguous()
+
+
 class _PPISPRegularizationFunction(torch.autograd.Function):
-    """Custom autograd function for the PPISP regularization loss."""
+    """Custom autograd function for the PPISP regularization loss.
+
+    ``weights`` is one tuple of six floats in the order
+    ``(exposure_mean, vig_center, vig_channel, vig_non_pos, color_mean,
+    crf_channel)`` so the autograd machinery handles five arguments instead
+    of ten every step.
+    """
 
     @staticmethod
     def forward(
@@ -269,26 +287,12 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
         vignetting_params: torch.Tensor,
         color_params: torch.Tensor,
         crf_params: torch.Tensor,
-        exposure_mean_weight: float,
-        vig_center_weight: float,
-        vig_channel_weight: float,
-        vig_non_pos_weight: float,
-        color_mean_weight: float,
-        crf_channel_weight: float,
+        weights: tuple[float, float, float, float, float, float],
     ) -> torch.Tensor:
-        exposure_params = exposure_params.float().contiguous()
-        vignetting_params = vignetting_params.float().contiguous()
-        color_params = color_params.float().contiguous()
-        crf_params = crf_params.float().contiguous()
-
-        weights = (
-            float(exposure_mean_weight),
-            float(vig_center_weight),
-            float(vig_channel_weight),
-            float(vig_non_pos_weight),
-            float(color_mean_weight),
-            float(crf_channel_weight),
-        )
+        exposure_params = _as_float_contiguous(exposure_params)
+        vignetting_params = _as_float_contiguous(vignetting_params)
+        color_params = _as_float_contiguous(color_params)
+        crf_params = _as_float_contiguous(crf_params)
 
         loss, frame_mean_sums = _C.ppisp_regularization_forward(
             exposure_params,
@@ -310,17 +314,18 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
             ctx.saved_tensors
         )
 
+        # The wrapper makes v_loss contiguous; a 0-d tensor already is.
         grads = _C.ppisp_regularization_backward(
             exposure_params,
             vignetting_params,
             color_params,
             crf_params,
-            v_loss.contiguous(),
+            v_loss,
             frame_mean_sums,
             *ctx.weights,
         )
 
-        return grads + (None,) * 6
+        return grads + (None,)
 
 
 # =============================================================================
@@ -393,13 +398,13 @@ def ppisp_apply(
         )
 
     # Convert to float32 and ensure contiguous memory layout
-    exposure_params = exposure_params.float().contiguous()
-    vignetting_params = vignetting_params.float().contiguous()
-    color_params = color_params.float().contiguous()
-    crf_params = crf_params.float().contiguous()
-    rgb_flat = rgb_flat.float().contiguous()
+    exposure_params = _as_float_contiguous(exposure_params)
+    vignetting_params = _as_float_contiguous(vignetting_params)
+    color_params = _as_float_contiguous(color_params)
+    crf_params = _as_float_contiguous(crf_params)
+    rgb_flat = _as_float_contiguous(rgb_flat)
     if coords_flat is not None:
-        coords_flat = coords_flat.float().contiguous()
+        coords_flat = _as_float_contiguous(coords_flat)
 
     rgb_out = _PPISPFunction.apply(
         exposure_params,
@@ -796,12 +801,14 @@ class PPISP(nn.Module):
             self.vignetting_params,
             self.color_params,
             self.crf_params,
-            cfg.exposure_mean,
-            cfg.vig_center,
-            cfg.vig_channel,
-            cfg.vig_non_pos,
-            cfg.color_mean,
-            cfg.crf_channel,
+            (
+                cfg.exposure_mean,
+                cfg.vig_center,
+                cfg.vig_channel,
+                cfg.vig_non_pos,
+                cfg.color_mean,
+                cfg.crf_channel,
+            ),
         )
 
     def create_optimizers(self) -> list[torch.optim.Optimizer]:

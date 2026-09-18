@@ -592,12 +592,7 @@ def test_regularization_autograd_accepts_non_contiguous_inputs():
         vignetting,
         color,
         crf,
-        cfg.exposure_mean,
-        cfg.vig_center,
-        cfg.vig_channel,
-        cfg.vig_non_pos,
-        cfg.color_mean,
-        cfg.crf_channel,
+        _weights(cfg),
     )
     loss_torch = _regularization_loss_torch_from_tensors(
         exposure,
@@ -614,6 +609,29 @@ def test_regularization_autograd_accepts_non_contiguous_inputs():
     for base in (exposure_base, vignetting_base, color_base, crf_base):
         assert base.grad is not None
         assert torch.isfinite(base.grad).all()
+
+
+def test_as_float_contiguous_returns_ready_inputs_unchanged():
+    ready = torch.zeros(4, 3, device="cuda")
+    assert ppisp._as_float_contiguous(ready) is ready
+
+    strided = torch.zeros(4, 6, device="cuda")[:, ::2]
+    converted = ppisp._as_float_contiguous(strided)
+    assert converted is not strided
+    assert converted.is_contiguous() and converted.dtype is torch.float32
+    assert torch.equal(converted, strided)
+
+    double = torch.ones(4, 3, device="cuda", dtype=torch.float64)
+    converted = ppisp._as_float_contiguous(double)
+    assert converted.dtype is torch.float32
+    assert torch.equal(converted, double.float())
+
+
+def test_regularization_accepts_integer_weights():
+    cfg = _make_config(exposure_mean=1, vig_center=0, vig_channel=0, vig_non_pos=0, color_mean=0, crf_channel=0)
+    module = _make_module(seed=77, config=cfg)
+    loss = module.get_regularization_loss()
+    torch.testing.assert_close(loss, _regularization_loss_torch(module), atol=1e-6, rtol=1e-5)
 
 
 def test_regularization_color_pinv_blocks_are_symmetric():

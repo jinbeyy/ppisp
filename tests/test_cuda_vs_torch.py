@@ -477,6 +477,65 @@ def test_backward_multiple_pixels_per_thread():
         assert rel_error <= 1e-3, f"{name} grad: rel_error={rel_error:.2e}"
 
 
+def test_backward_saturated_pixels():
+    """Backward with many pixels clamped at the ends of the CRF.
+
+    Both implementations cut off the normalized toe/shoulder input gradients
+    at the endpoints while preserving gamma gradients for every positive y.
+    The forward keeps black at 0 and saturation at 1.
+    """
+    params_cuda = create_test_params(num_cameras=2, num_frames=5, seed=1)
+    params_torch = create_test_params(num_cameras=2, num_frames=5, seed=1)
+    inputs = create_test_inputs(
+        batch_size=65536, num_cameras=2, num_frames=5, seed=1)
+    # Push a large fraction of the channels past 1.0 before the CRF, and make
+    # the first rows pure black.
+    num_black = 256
+    inputs['rgb'] = inputs['rgb'] * 1.3
+    inputs['rgb'][:num_black] = 0.0
+
+    rgb_cuda = inputs['rgb'].clone().requires_grad_(True)
+    rgb_torch = inputs['rgb'].clone().requires_grad_(True)
+
+    output_cuda = run_cuda_forward(params_cuda, inputs, rgb_cuda)
+    output_torch = run_torch_forward(params_torch, inputs, rgb_torch)
+    min_saturated_fraction = 0.1  # enough clamped channels for a meaningful test
+    saturated = (output_torch >= 0.9999).sum().item()
+    assert saturated > output_torch.numel() * min_saturated_fraction, (
+        f"only {saturated} saturated channels; test would be vacuous")
+    assert torch.equal(output_cuda[:num_black], torch.zeros_like(output_cuda[:num_black])), (
+        "black input must stay exactly black")
+    assert torch.equal(output_torch[:num_black], torch.zeros_like(output_torch[:num_black]))
+
+    grad_output = torch.randn_like(output_cuda)
+    output_cuda.backward(grad_output)
+    output_torch.backward(grad_output)
+
+    # No pixel may receive a wildly different gradient.
+    max_pixel_diff = (rgb_cuda.grad - rgb_torch.grad).abs().max().item()
+    assert max_pixel_diff <= 0.5, f"rgb_in grad max pixel diff={max_pixel_diff:.2e}"
+
+    # Pixels within float error of the clamp remain ill-conditioned, so the
+    # parameter sums they dominate get a looser tolerance than the per-pixel
+    # rgb gradient.
+    grad_pairs = [
+        ('rgb_in', rgb_cuda.grad, rgb_torch.grad, 1e-3),
+        ('exposure', params_cuda['exposure_params'].grad,
+         params_torch['exposure_params'].grad, 1e-2),
+        ('vignetting', params_cuda['vignetting_params'].grad,
+         params_torch['vignetting_params'].grad, 1e-2),
+        ('color', params_cuda['color_params'].grad,
+         params_torch['color_params'].grad, 1e-2),
+        ('crf', params_cuda['crf_params'].grad,
+         params_torch['crf_params'].grad, 1e-2),
+    ]
+    for name, grad_cuda, grad_torch, tol in grad_pairs:
+        ref_norm = torch.norm(grad_torch).item()
+        assert ref_norm > 0, f"{name} reference grad is zero; test would be vacuous"
+        rel_error = (torch.norm(grad_cuda - grad_torch).item() / ref_norm)
+        assert rel_error <= tol, f"{name} grad: rel_error={rel_error:.2e}"
+
+
 # =============================================================================
 # Stress Tests
 # =============================================================================

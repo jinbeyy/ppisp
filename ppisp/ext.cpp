@@ -22,4 +22,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ppisp_backward", &ppisp_backward_tensor);
     m.def("ppisp_regularization_forward", &ppisp_regularization_forward_tensor);
     m.def("ppisp_regularization_backward", &ppisp_regularization_backward_tensor);
+    // The PyTorch reference in tests mirrors this dead zone; the tests assert equality.
+    m.attr("CRF_BASE_GRAD_EPS") = PPISP_CRF_BASE_GRAD_EPS;
 }

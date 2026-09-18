@@ -19,11 +19,15 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 
 #include <cub/cub.cuh>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAMacros.h>
 
 #include "ppisp_constants.h"
 #include "ppisp_math.cuh"
@@ -121,8 +125,35 @@ __global__ void ppisp_kernel(int batch_size, int num_cameras, int num_frames,
 // PPISP Backward Kernel
 // ============================================================================
 
+// Each thread accumulates parameter gradients over several pixels, then the
+// block reduces all accumulators at once: warp shuffles, one shared-memory
+// exchange, one barrier, and one global atomic per parameter per block.
+// Register-cap request for __launch_bounds__: three resident blocks per SM
+// measured 3% faster than the unconstrained build on sm_89 and sm_90. The grid
+// cap is not derived from it; ppisp_bwd_resident_blocks asks the occupancy API.
+constexpr int PPISP_BWD_MIN_BLOCKS_PER_SM = 3;
+constexpr int PPISP_BWD_NUM_COLOR = PPISP_COLOR_PARAMS;                             // 8
+constexpr int PPISP_BWD_NUM_VIG = 3 * PPISP_VIGNETTING_PARAMS_PER_CHANNEL;          // 15
+constexpr int PPISP_BWD_NUM_CRF = 3 * PPISP_CRF_PARAMS_PER_CHANNEL;                 // 12
+constexpr int PPISP_BWD_NUM_ACCUM = 1 + PPISP_BWD_NUM_COLOR + PPISP_BWD_NUM_VIG + PPISP_BWD_NUM_CRF;  // 36
+// The block reduction views each gradient struct as a flat float array on both
+// the accumulator and the output side, so the structs must be packed floats.
+static_assert(sizeof(ColorPPISPParams) == PPISP_BWD_NUM_COLOR * sizeof(float), "layout");
+static_assert(sizeof(VignettingChannelParams) == PPISP_VIGNETTING_PARAMS_PER_CHANNEL * sizeof(float), "layout");
+static_assert(sizeof(CRFPPISPChannelParams) == PPISP_CRF_PARAMS_PER_CHANNEL * sizeof(float), "layout");
+
+__device__ __forceinline__ float ppisp_warp_sum(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+// On sm_89 the register cap lands at 80 registers, which spills a little but
+// measured faster than the unconstrained 109 at 960x540, 1920x1080, and 3840x2160.
 template <int BLOCK_SIZE>
-__global__ void ppisp_bwd_kernel(
+__global__ void __launch_bounds__(BLOCK_SIZE, PPISP_BWD_MIN_BLOCKS_PER_SM) ppisp_bwd_kernel(
     int batch_size, int num_cameras, int num_frames, const float *__restrict__ exposure_params,
     const VignettingChannelParams *__restrict__ vignetting_params,
     const ColorPPISPParams *__restrict__ color_params,
@@ -134,7 +165,8 @@ __global__ void ppisp_bwd_kernel(
     CRFPPISPChannelParams *__restrict__ grad_crf_params, float3 *__restrict__ grad_rgb_in,
     const float2 *__restrict__ pixel_coords, int resolution_x, int resolution_y, int camera_idx,
     int frame_idx) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    static_assert(BLOCK_SIZE % 32 == 0 && BLOCK_SIZE >= PPISP_BWD_NUM_ACCUM, "block size");
 
     // Per-thread gradient accumulators
     float grad_exposure_local = 0.0f;
@@ -143,7 +175,8 @@ __global__ void ppisp_bwd_kernel(
     ColorPPISPParams grad_color_local = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
     CRFPPISPChannelParams grad_crf_local[3] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
 
-    if (tid < batch_size) {
+    for (int tid = blockIdx.x * blockDim.x + threadIdx.x; tid < batch_size;
+         tid += blockDim.x * gridDim.x) {
         // Load input
         float3 rgb_input = rgb_in[tid];
 
@@ -211,125 +244,70 @@ __global__ void ppisp_bwd_kernel(
 
         // 1. Exposure backward
         if (frame_idx != -1) {
+            float grad_exposure_pixel;
             apply_exposure_bwd(rgb_input, exposure_params[frame_idx], grad_rgb, grad_rgb,
-                               grad_exposure_local);
+                               grad_exposure_pixel);
+            grad_exposure_local += grad_exposure_pixel;
         }
 
         // Store RGB input gradient
         grad_rgb_in[tid] = grad_rgb;
-    }  // END if (tid < batch_size)
-
-    // Block-level reduction and atomic add for parameter gradients
-    typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduceFloat;
-    typedef cub::BlockReduce<float2, BLOCK_SIZE> BlockReduceFloat2;
-
-    if (frame_idx != -1) {
-        // Exposure
-        {
-            __shared__ typename BlockReduceFloat::TempStorage temp;
-            float val = BlockReduceFloat(temp).Sum(grad_exposure_local);
-            if (threadIdx.x == 0)
-                atomicAdd(&grad_exposure_params[frame_idx], val);
-        }
-
-        // Color params (4 x float2)
-        {
-            __shared__ typename BlockReduceFloat2::TempStorage temp;
-            ColorPPISPParams *grad_color_out = &grad_color_params[frame_idx];
-
-            float2 val_b = BlockReduceFloat2(temp).Sum(grad_color_local.b);
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                atomicAdd(&grad_color_out->b.x, val_b.x);
-                atomicAdd(&grad_color_out->b.y, val_b.y);
-            }
-
-            float2 val_r = BlockReduceFloat2(temp).Sum(grad_color_local.r);
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                atomicAdd(&grad_color_out->r.x, val_r.x);
-                atomicAdd(&grad_color_out->r.y, val_r.y);
-            }
-
-            float2 val_g = BlockReduceFloat2(temp).Sum(grad_color_local.g);
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                atomicAdd(&grad_color_out->g.x, val_g.x);
-                atomicAdd(&grad_color_out->g.y, val_g.y);
-            }
-
-            float2 val_n = BlockReduceFloat2(temp).Sum(grad_color_local.n);
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                atomicAdd(&grad_color_out->n.x, val_n.x);
-                atomicAdd(&grad_color_out->n.y, val_n.y);
-            }
-        }
     }
 
-    if (camera_idx != -1) {
-        // Vignetting params (3 channels x 5 params)
-        {
-            __shared__ typename BlockReduceFloat::TempStorage temp;
-            VignettingChannelParams *grad_vig_out = &grad_vignetting_params[camera_idx * 3];
-
+    // Pack accumulators: [exposure | color(8) | vignetting(15) | crf(12)], viewing
+    // the local structs as flat floats exactly as the output side does below.
+    float acc[PPISP_BWD_NUM_ACCUM];
+    acc[0] = grad_exposure_local;
+    {
+        const float *color = reinterpret_cast<const float *>(&grad_color_local);
+        const float *vig = reinterpret_cast<const float *>(grad_vignetting_local);
+        const float *crf = reinterpret_cast<const float *>(grad_crf_local);
 #pragma unroll
-            for (int ch = 0; ch < 3; ch++) {
-                float val_cx = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].cx);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_vig_out[ch].cx, val_cx);
-
-                float val_cy = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].cy);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_vig_out[ch].cy, val_cy);
-
-                float val_a0 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha0);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_vig_out[ch].alpha0, val_a0);
-
-                float val_a1 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha1);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_vig_out[ch].alpha1, val_a1);
-
-                float val_a2 = BlockReduceFloat(temp).Sum(grad_vignetting_local[ch].alpha2);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_vig_out[ch].alpha2, val_a2);
-            }
-        }
-
-        // CRF params (3 channels x 4 params)
-        {
-            __shared__ typename BlockReduceFloat::TempStorage temp;
-            CRFPPISPChannelParams *grad_crf_out = &grad_crf_params[camera_idx * 3];
-
+        for (int k = 0; k < PPISP_BWD_NUM_COLOR; k++) acc[1 + k] = color[k];
 #pragma unroll
-            for (int ch = 0; ch < 3; ch++) {
-                float val_toe = BlockReduceFloat(temp).Sum(grad_crf_local[ch].toe);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_crf_out[ch].toe, val_toe);
+        for (int k = 0; k < PPISP_BWD_NUM_VIG; k++) acc[1 + PPISP_BWD_NUM_COLOR + k] = vig[k];
+#pragma unroll
+        for (int k = 0; k < PPISP_BWD_NUM_CRF; k++)
+            acc[1 + PPISP_BWD_NUM_COLOR + PPISP_BWD_NUM_VIG + k] = crf[k];
+    }
 
-                float val_shoulder = BlockReduceFloat(temp).Sum(grad_crf_local[ch].shoulder);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_crf_out[ch].shoulder, val_shoulder);
-
-                float val_gamma = BlockReduceFloat(temp).Sum(grad_crf_local[ch].gamma);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_crf_out[ch].gamma, val_gamma);
-
-                float val_center = BlockReduceFloat(temp).Sum(grad_crf_local[ch].center);
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    atomicAdd(&grad_crf_out[ch].center, val_center);
-            }
+    // Block reduction: warp shuffle, then one shared-memory exchange. The frame
+    // slots are all zero when frame_idx == -1 and the camera slots when
+    // camera_idx == -1, so those slots are skipped (uniform per kernel argument).
+    const bool frame_active = frame_idx != -1;
+    const bool camera_active = camera_idx != -1;
+    __shared__ float warp_sums[NUM_WARPS][PPISP_BWD_NUM_ACCUM];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int i = 0; i < PPISP_BWD_NUM_ACCUM; i++) {
+        if (i < 1 + PPISP_BWD_NUM_COLOR ? frame_active : camera_active) {
+            float v = ppisp_warp_sum(acc[i]);
+            if (lane == 0) warp_sums[warp][i] = v;
         }
+    }
+    __syncthreads();
+
+    // One thread per parameter: sum warps and add to the global gradient
+    const int i = threadIdx.x;
+    if (i < PPISP_BWD_NUM_ACCUM && (i < 1 + PPISP_BWD_NUM_COLOR ? frame_active : camera_active)) {
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++) total += warp_sums[w][i];
+
+        float *dst;
+        if (i == 0) {
+            dst = &grad_exposure_params[frame_idx];
+        } else if (i < 1 + PPISP_BWD_NUM_COLOR) {
+            dst = reinterpret_cast<float *>(&grad_color_params[frame_idx]) + (i - 1);
+        } else if (i < 1 + PPISP_BWD_NUM_COLOR + PPISP_BWD_NUM_VIG) {
+            dst = reinterpret_cast<float *>(&grad_vignetting_params[camera_idx * 3]) +
+                  (i - 1 - PPISP_BWD_NUM_COLOR);
+        } else {
+            dst = reinterpret_cast<float *>(&grad_crf_params[camera_idx * 3]) +
+                  (i - 1 - PPISP_BWD_NUM_COLOR - PPISP_BWD_NUM_VIG);
+        }
+        atomicAdd(dst, total);
     }
 }
 
@@ -362,6 +340,29 @@ void ppisp_forward(const float *exposure_params, const float *vignetting_params,
 // Backward Pass Implementation
 // ============================================================================
 
+// Blocks of the backward kernel that the current device holds at once, from
+// the occupancy API for the compiled kernel, so the grid cap follows the real
+// register and shared-memory footprint on every architecture. Cached per
+// device; the launch path does one relaxed atomic load.
+static int ppisp_bwd_resident_blocks() {
+    static std::array<std::atomic<int>, C10_COMPILE_TIME_MAX_GPUS> cache{};
+    const int device = c10::cuda::current_device();
+    int blocks = cache[device].load(std::memory_order_relaxed);
+    if (blocks == 0) {
+        int blocks_per_sm = 0;
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, ppisp_bwd_kernel<PPISP_BLOCK_SIZE>, PPISP_BLOCK_SIZE, 0));
+        // Plain runtime query rather than at::cuda::getCurrentDeviceProperties():
+        // that lives in libtorch_cuda, which consumers linking only c10_cuda
+        // (the NRE Bazel build) do not provide.
+        int sm_count = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+        blocks = std::max(blocks_per_sm, 1) * std::max(sm_count, 1);
+        cache[device].store(blocks, std::memory_order_relaxed);
+    }
+    return blocks;
+}
+
 void ppisp_backward(const float *exposure_params, const float *vignetting_params,
                     const float *color_params, const float *crf_params, const float *rgb_in,
                     const float *rgb_out, const float *pixel_coords, const float *v_rgb_out,
@@ -371,7 +372,9 @@ void ppisp_backward(const float *exposure_params, const float *vignetting_params
                     int frame_idx) {
     if (num_pixels == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
-    const int blocks = divUp(num_pixels, threads);
+    // No more blocks than can be resident at once: the grid-stride loop absorbs
+    // the rest, so no partial wave of blocks trails the launch.
+    const int blocks = std::min(divUp(num_pixels, threads), ppisp_bwd_resident_blocks());
     const auto stream = at::cuda::getCurrentCUDAStream();
 
     ppisp_bwd_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(

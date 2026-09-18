@@ -19,6 +19,7 @@
 #define _PPISP_BINDINGS_H_INC
 
 #include <torch/extension.h>
+#include <limits>
 
 #include "src/ppisp_constants.h"
 
@@ -113,6 +114,10 @@ torch::Tensor ppisp_forward_tensor(torch::Tensor exposure_params,    // [num_fra
                                    c10::optional<torch::Tensor> pixel_coords,  // [num_pixels, 2]
                                    int resolution_w, int resolution_h, int camera_idx,
                                    int frame_idx) {
+    // Kernels index pixels with int and the backward's grid-stride loop runs past
+    // the end by at most one stride, so keep the count well inside the int range.
+    TORCH_CHECK(rgb_in.size(0) <= std::numeric_limits<int>::max() / 2,
+                "ppisp: too many pixels for int indexing: ", rgb_in.size(0));
     int num_pixels = rgb_in.size(0);
     int num_cameras = crf_params.size(0);
     int num_frames = exposure_params.size(0);
@@ -134,6 +139,10 @@ ppisp_backward_tensor(torch::Tensor exposure_params, torch::Tensor vignetting_pa
                       torch::Tensor rgb_out, c10::optional<torch::Tensor> pixel_coords,
                       torch::Tensor v_rgb_out, int resolution_w, int resolution_h, int camera_idx,
                       int frame_idx) {
+    // Kernels index pixels with int and the backward's grid-stride loop runs past
+    // the end by at most one stride, so keep the count well inside the int range.
+    TORCH_CHECK(rgb_in.size(0) <= std::numeric_limits<int>::max() / 2,
+                "ppisp: too many pixels for int indexing: ", rgb_in.size(0));
     int num_pixels = rgb_in.size(0);
     int num_cameras = crf_params.size(0);
     int num_frames = exposure_params.size(0);
@@ -142,7 +151,7 @@ ppisp_backward_tensor(torch::Tensor exposure_params, torch::Tensor vignetting_pa
     auto v_vignetting_params = torch::zeros_like(vignetting_params);
     auto v_color_params = torch::zeros_like(color_params);
     auto v_crf_params = torch::zeros_like(crf_params);
-    auto v_rgb_in = torch::zeros_like(rgb_in);
+    auto v_rgb_in = torch::empty_like(rgb_in);  // fully written by the kernel
 
     ppisp_backward(exposure_params.data_ptr<float>(), vignetting_params.data_ptr<float>(),
                    color_params.data_ptr<float>(), crf_params.data_ptr<float>(),

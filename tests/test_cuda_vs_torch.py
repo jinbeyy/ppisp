@@ -425,6 +425,58 @@ def test_backward_no_frame_effects():
     assert max_diff <= atol, f"CRF grad max_diff={max_diff}"
 
 
+def test_backward_multiple_pixels_per_thread():
+    """Backward with enough pixels that each thread accumulates several pixels.
+
+    The CUDA backward kernel caps its grid at the resident block count and
+    grid-strides over the remaining pixels, reducing the parameter gradients
+    once per block; small batches never exercise that accumulation. A 960x540
+    image is many strides long on any current GPU, and on most SM counts the
+    stride does not divide it, so the tail is ragged as well.
+    """
+    # Seed chosen so the sampled vignetting falloff is not clamped, which
+    # would zero the vignetting gradient and make its comparison vacuous.
+    params_cuda = create_test_params(num_cameras=2, num_frames=5, seed=1)
+    params_torch = create_test_params(num_cameras=2, num_frames=5, seed=1)
+    inputs = create_test_inputs(
+        batch_size=960 * 540, num_cameras=2, num_frames=5, seed=1)
+    # Keep every pixel below CRF saturation so this test isolates the
+    # reduction; the CRF derivative is ill-conditioned next to the clamp and
+    # saturated pixels are covered by test_backward_saturated_pixels.
+    inputs['rgb'] = inputs['rgb'] * 0.75
+
+    rgb_cuda = inputs['rgb'].clone().requires_grad_(True)
+    rgb_torch = inputs['rgb'].clone().requires_grad_(True)
+
+    output_cuda = run_cuda_forward(params_cuda, inputs, rgb_cuda)
+    output_torch = run_torch_forward(params_torch, inputs, rgb_torch)
+
+    grad_output = torch.randn_like(output_cuda)
+    output_cuda.backward(grad_output)
+    output_torch.backward(grad_output)
+
+    grad_pairs = [
+        ('rgb_in', rgb_cuda.grad, rgb_torch.grad),
+        ('exposure', params_cuda['exposure_params'].grad,
+         params_torch['exposure_params'].grad),
+        ('vignetting', params_cuda['vignetting_params'].grad,
+         params_torch['vignetting_params'].grad),
+        ('color', params_cuda['color_params'].grad,
+         params_torch['color_params'].grad),
+        ('crf', params_cuda['crf_params'].grad,
+         params_torch['crf_params'].grad),
+    ]
+
+    # Parameter gradients are float32 sums over thousands of signed terms, so
+    # compare norm-relative error with a tolerance above the cancellation noise.
+    # A lost pixel group would show up as a relative error of order 1.
+    for name, grad_cuda, grad_torch in grad_pairs:
+        ref_norm = torch.norm(grad_torch).item()
+        assert ref_norm > 0, f"{name} reference grad is zero; test would be vacuous"
+        rel_error = (torch.norm(grad_cuda - grad_torch).item() / ref_norm)
+        assert rel_error <= 1e-3, f"{name} grad: rel_error={rel_error:.2e}"
+
+
 # =============================================================================
 # Stress Tests
 # =============================================================================

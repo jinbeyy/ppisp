@@ -94,21 +94,24 @@ def test_both_none_matches_explicit():
         f"max diff: {(out_explicit - out_none).abs().max().item()}"
 
 
-def test_pixel_coords_none_backward():
+# 960x540 exceeds the capped backward grid on any current GPU, so every thread
+# derives several pixel centers from its grid-stride loop index.
+@pytest.mark.parametrize("height,width", [(H, W), (540, 960)])
+def test_pixel_coords_none_backward(height, width):
     """Gradients should match between explicit and omitted pixel_coords."""
     params_a = _make_params(seed=99)
     params_b = _make_params(seed=99)
-    rgb_a = (torch.rand(H, W, 3, device="cuda")
+    rgb_a = (torch.rand(height, width, 3, device="cuda")
              * 0.6 + 0.2).requires_grad_(True)
     rgb_b = rgb_a.detach().clone().requires_grad_(True)
 
-    pixel_coords = _make_pixel_centers(H, W)
+    pixel_coords = _make_pixel_centers(height, width)
 
     out_a = ppisp.ppisp_apply(**params_a, rgb_in=rgb_a, pixel_coords=pixel_coords,
-                              resolution_w=W, resolution_h=H,
+                              resolution_w=width, resolution_h=height,
                               camera_idx=0, frame_idx=0)
     out_b = ppisp.ppisp_apply(**params_b, rgb_in=rgb_b, pixel_coords=None,
-                              resolution_w=W, resolution_h=H,
+                              resolution_w=width, resolution_h=height,
                               camera_idx=0, frame_idx=0)
 
     grad = torch.randn_like(out_a)
@@ -118,9 +121,26 @@ def test_pixel_coords_none_backward():
     assert torch.allclose(rgb_a.grad, rgb_b.grad, atol=1e-5), \
         f"rgb grad max diff: {(rgb_a.grad - rgb_b.grad).abs().max().item()}"
 
+    # Parameter gradients are atomic sums over every pixel, so their block
+    # order differs between the two runs; compare relative to the magnitude.
     for name in ("exposure_params", "vignetting_params", "color_params", "crf_params"):
-        diff = (params_a[name].grad - params_b[name].grad).abs().max().item()
-        assert diff < 1e-5, f"{name} grad max diff: {diff}"
+        torch.testing.assert_close(params_a[name].grad, params_b[name].grad,
+                                   rtol=1e-4, atol=1e-5, msg=lambda m: f"{name}: {m}")
+
+
+def test_parameter_grads_do_not_share_storage():
+    """Each parameter's .grad owns its allocation after the CUDA backward."""
+    params = _make_params()
+    rgb = (torch.rand(H, W, 3, device="cuda") * 0.6 + 0.2).requires_grad_(True)
+    out = ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=None,
+                            resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
+    out.sum().backward()
+    grads = [p.grad for p in params.values()]
+    storages = {g.untyped_storage().data_ptr() for g in grads}
+    assert len(storages) == len(grads), "parameter grads alias one storage"
+    for g in grads:
+        assert g.storage_offset() == 0
+        assert g.untyped_storage().nbytes() == g.numel() * g.element_size()
 
 
 if __name__ == "__main__":

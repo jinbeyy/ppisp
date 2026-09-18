@@ -81,10 +81,8 @@ void ppisp_regularization_forward(
     float crf_channel_weight);
 
 void ppisp_regularization_backward(
-    // Parameters (per-frame/per-camera)
-    const float *exposure_params,    // [num_frames]
+    // Camera parameters; the frame terms only need the saved frame_mean_sums
     const float *vignetting_params,  // [num_cameras, 3, 5]
-    const float *color_params,       // [num_frames, 8]
     const float *crf_params,         // [num_cameras, 3, 4]
     // Upstream gradient
     const float *grad_loss,  // scalar
@@ -205,14 +203,15 @@ ppisp_regularization_backward_tensor(
     int num_frames = exposure_params.size(0);
 
     auto grad_loss_contig = grad_loss.contiguous();
-    auto grad_exposure_params = torch::zeros_like(exposure_params);
-    auto grad_vignetting_params = torch::zeros_like(vignetting_params);
-    auto grad_color_params = torch::zeros_like(color_params);
-    auto grad_crf_params = torch::zeros_like(crf_params);
+    // Every element is assigned by the backward kernel, zero for disabled terms.
+    auto grad_exposure_params = torch::empty_like(exposure_params);
+    auto grad_vignetting_params = torch::empty_like(vignetting_params);
+    auto grad_color_params = torch::empty_like(color_params);
+    auto grad_crf_params = torch::empty_like(crf_params);
 
     ppisp_regularization_backward(
-        exposure_params.data_ptr<float>(), vignetting_params.data_ptr<float>(),
-        color_params.data_ptr<float>(), crf_params.data_ptr<float>(), grad_loss_contig.data_ptr<float>(),
+        vignetting_params.data_ptr<float>(), crf_params.data_ptr<float>(),
+        grad_loss_contig.data_ptr<float>(),
         grad_exposure_params.data_ptr<float>(), grad_vignetting_params.data_ptr<float>(),
         grad_color_params.data_ptr<float>(), grad_crf_params.data_ptr<float>(),
         frame_mean_sums.data_ptr<float>(), num_cameras, num_frames, exposure_mean_weight,

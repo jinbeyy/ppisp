@@ -178,7 +178,7 @@ def _assert_loss_and_grads_match(
             grad_cuda = torch.zeros_like(param_cuda)
         if grad_torch is None:
             grad_torch = torch.zeros_like(param_torch)
-        max_diff = (grad_cuda - grad_torch).abs().max().item()
+        max_diff = (grad_cuda - grad_torch).abs().max().item() if grad_cuda.numel() else 0.0
         assert torch.allclose(grad_cuda, grad_torch, atol=grad_atol, rtol=grad_rtol), (
             f"{name} grad max_diff={max_diff}"
         )
@@ -708,13 +708,28 @@ def test_regularization_forward_weight_combinations(mask, disabled_weight):
 
 
 @pytest.mark.parametrize("frames,cameras", [(0, 0), (0, 8), (257, 0), (255, 8), (256, 8), (257, 8)])
-def test_regularization_forward_empty_and_boundary(frames, cameras):
+def test_regularization_empty_and_boundary(frames, cameras):
+    """Forward and backward with empty or block-boundary frame and camera counts.
+
+    The fused kernels replaced the old per-group early returns with a shared
+    work bound and an inv_frames guard, so the backward runs here as well.
+    """
     module = _make_module(seed=911, num_cameras=cameras, num_frames=frames)
     cfg = module.config
     if frames == 0:
         cfg = replace(cfg, exposure_mean=0.0, color_mean=0.0)
     if cameras == 0:
         cfg = replace(cfg, vig_center=0.0, vig_channel=0.0, vig_non_pos=0.0, crf_channel=0.0)
+    if frames == 0 and cameras == 0:
+        # No parameter has elements, so the reference loss is a constant without
+        # a graph; check the CUDA path alone.
+        loss = module.get_regularization_loss()
+        assert loss.item() == 0.0
+        loss.backward()
+        for parameter in module.parameters():
+            assert parameter.grad is not None and parameter.grad.numel() == 0
+        return
     reference = _make_module(seed=911, num_cameras=cameras, num_frames=frames, config=cfg)
-    torch.testing.assert_close(module.get_regularization_loss(), _regularization_loss_torch(reference),
-                               atol=2e-5, rtol=1e-5)
+    _assert_loss_and_grads_match(module, reference, loss_atol=2e-5, grad_atol=1e-5, grad_rtol=1e-4)
+    for parameter in module.parameters():
+        assert torch.isfinite(parameter.grad).all()

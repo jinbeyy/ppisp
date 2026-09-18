@@ -22,7 +22,6 @@
 #include <array>
 #include <atomic>
 
-
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -568,131 +567,124 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ppisp_regularization_forward_kerne
     if (lane == 0) loss[0] = term;
 }
 
-__global__ void ppisp_regularization_frame_mean_backward_kernel(
+// One thread per index covers the frame terms (exposure and color mean) and
+// the camera terms (vignetting and CRF). Every gradient element has exactly
+// one owner thread and is assigned with a plain store, zero when its term is
+// disabled, so the outputs need no initialization.
+__global__ void ppisp_regularization_backward_kernel(
+    const float *__restrict__ vignetting_params, const float *__restrict__ crf_params,
     const float *__restrict__ frame_mean_sums, const float *__restrict__ grad_loss,
-    float *__restrict__ grad_exposure_params, float *__restrict__ grad_color_params,
-    int num_frames, float exposure_mean_weight, float color_mean_weight) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    if (num_frames <= 0) {
-        return;
-    }
-
-    float inv_frames = 1.0f / static_cast<float>(num_frames);
-    float upstream = grad_loss[0];
-    float grad_exposure = 0.0f;
-    float grad_offsets[PPISP_COLOR_PARAMS];
-
-    if (exposure_mean_weight > 0.0f) {
-        float exposure_residual = frame_mean_sums[0] * inv_frames;
-        grad_exposure = upstream * exposure_mean_weight *
-                        ppisp_smooth_l1_bwd(exposure_residual, 0.1f) * inv_frames;
-    }
-
-#pragma unroll
-    for (int i = 0; i < PPISP_COLOR_PARAMS; i++) {
-        grad_offsets[i] = 0.0f;
-        if (color_mean_weight > 0.0f) {
-            float color_residual = frame_mean_sums[1 + i] * inv_frames;
-            grad_offsets[i] =
-                upstream * color_mean_weight * ppisp_smooth_l1_bwd(color_residual, 0.005f) *
-                inv_frames / static_cast<float>(PPISP_COLOR_PARAMS);
-        }
-    }
-
-    for (int frame = tid; frame < num_frames; frame += stride) {
-        if (exposure_mean_weight > 0.0f) {
-            grad_exposure_params[frame] += grad_exposure;
-        }
-
-        if (color_mean_weight > 0.0f) {
-            int base = frame * PPISP_COLOR_PARAMS;
-#pragma unroll
-            for (int block = 0; block < 4; block++) {
-                float2 grad_offset =
-                    make_float2(grad_offsets[block * 2], grad_offsets[block * 2 + 1]);
-                float2 grad_latent;
-                ppisp_color_offset_grad_to_latent(block, grad_offset, grad_latent);
-                grad_color_params[base + block * 2] += grad_latent.x;
-                grad_color_params[base + block * 2 + 1] += grad_latent.y;
-            }
-        }
-    }
-}
-
-__global__ void ppisp_regularization_vignetting_backward_kernel(
-    const float *__restrict__ vignetting_params, const float *__restrict__ grad_loss,
-    float *__restrict__ grad_vignetting_params, int num_cameras, float vig_center_weight,
-    float vig_channel_weight, float vig_non_pos_weight) {
+    float *__restrict__ grad_exposure_params, float *__restrict__ grad_vignetting_params,
+    float *__restrict__ grad_color_params, float *__restrict__ grad_crf_params,
+    int num_frames, int num_cameras, float exposure_mean_weight, float vig_center_weight,
+    float vig_channel_weight, float vig_non_pos_weight, float color_mean_weight,
+    float crf_channel_weight) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     int total_vig = num_cameras * PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
+    int total_crf = num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL;
+    int total = max(num_frames, max(total_vig, total_crf));
     float upstream = grad_loss[0];
-    float inv_vig_center_denom = 1.0f / static_cast<float>(num_cameras * 3);
-    float inv_vig_non_pos_denom = 1.0f / static_cast<float>(num_cameras * 3 * 3);
-    float inv_vig_channel_denom =
-        1.0f / static_cast<float>(num_cameras * PPISP_VIGNETTING_PARAMS_PER_CHANNEL);
 
-    for (int idx = tid; idx < total_vig; idx += stride) {
-        int param_idx = idx % PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
-        int camera_idx = idx / PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
-        int base = camera_idx * 3 * PPISP_VIGNETTING_PARAMS_PER_CHANNEL + param_idx;
-        float v0 = vignetting_params[base];
-        float v1 = vignetting_params[base + PPISP_VIGNETTING_PARAMS_PER_CHANNEL];
-        float v2 = vignetting_params[base + 2 * PPISP_VIGNETTING_PARAMS_PER_CHANNEL];
-        float mean = (v0 + v1 + v2) / 3.0f;
-        float values[3] = {v0, v1, v2};
-
+    // Frame terms: the gradient is the same for every frame, so one thread per
+    // block computes the nine values and the block reads them from shared memory.
+    __shared__ float frame_grads[PPISP_FRAME_MEAN_SUMS_SIZE];
+    if (threadIdx.x == 0) {
+        float inv_frames = num_frames > 0 ? 1.0f / static_cast<float>(num_frames) : 0.0f;
+        float grad_exposure = 0.0f;
+        if (exposure_mean_weight > 0.0f) {
+            float exposure_residual = frame_mean_sums[0] * inv_frames;
+            grad_exposure = upstream * exposure_mean_weight *
+                            ppisp_smooth_l1_bwd(exposure_residual, 0.1f) * inv_frames;
+        }
+        frame_grads[0] = grad_exposure;
 #pragma unroll
-        for (int channel = 0; channel < 3; channel++) {
-            float val = values[channel];
-            float grad = 0.0f;
-
-            if (vig_center_weight > 0.0f && param_idx < 2) {
-                grad += vig_center_weight * 2.0f * val * inv_vig_center_denom;
+        for (int block = 0; block < 4; block++) {
+            float2 grad_latent = make_float2(0.0f, 0.0f);
+            if (color_mean_weight > 0.0f) {
+                float2 grad_offset;
+                grad_offset.x = upstream * color_mean_weight *
+                                ppisp_smooth_l1_bwd(frame_mean_sums[1 + block * 2] * inv_frames, 0.005f) *
+                                inv_frames / static_cast<float>(PPISP_COLOR_PARAMS);
+                grad_offset.y = upstream * color_mean_weight *
+                                ppisp_smooth_l1_bwd(frame_mean_sums[2 + block * 2] * inv_frames, 0.005f) *
+                                inv_frames / static_cast<float>(PPISP_COLOR_PARAMS);
+                ppisp_color_offset_grad_to_latent(block, grad_offset, grad_latent);
             }
-
-            if (vig_non_pos_weight > 0.0f && param_idx >= 2 && val > 0.0f) {
-                grad += vig_non_pos_weight * inv_vig_non_pos_denom;
-            }
-
-            if (vig_channel_weight > 0.0f) {
-                grad += vig_channel_weight * (2.0f / 3.0f) * (val - mean) *
-                        inv_vig_channel_denom;
-            }
-
-            grad_vignetting_params[base + channel * PPISP_VIGNETTING_PARAMS_PER_CHANNEL] +=
-                upstream * grad;
+            frame_grads[1 + block * 2] = grad_latent.x;
+            frame_grads[2 + block * 2] = grad_latent.y;
         }
     }
-}
+    __syncthreads();
 
-__global__ void ppisp_regularization_crf_backward_kernel(
-    const float *__restrict__ crf_params, const float *__restrict__ grad_loss,
-    float *__restrict__ grad_crf_params, int num_cameras, float crf_channel_weight) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    int total_crf = num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL;
-    float upstream = grad_loss[0];
-    float inv_crf_channel_denom =
-        1.0f / static_cast<float>(num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL);
+    // Camera terms. The upstream gradient is folded into the per-term scales so a
+    // disabled term stores an exact zero whatever the upstream value is.
+    float vig_center_scale = upstream * vig_center_weight * 2.0f / static_cast<float>(num_cameras * 3);
+    float vig_non_pos_scale = upstream * vig_non_pos_weight / static_cast<float>(num_cameras * 3 * 3);
+    float vig_channel_scale = upstream * vig_channel_weight * (2.0f / 3.0f) /
+                              static_cast<float>(num_cameras * PPISP_VIGNETTING_PARAMS_PER_CHANNEL);
+    float crf_channel_scale = upstream * crf_channel_weight * (2.0f / 3.0f) /
+                              static_cast<float>(num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL);
 
-    for (int idx = tid; idx < total_crf; idx += stride) {
-        int param_idx = idx % PPISP_CRF_PARAMS_PER_CHANNEL;
-        int camera_idx = idx / PPISP_CRF_PARAMS_PER_CHANNEL;
-        int base = camera_idx * 3 * PPISP_CRF_PARAMS_PER_CHANNEL + param_idx;
-        float v0 = crf_params[base];
-        float v1 = crf_params[base + PPISP_CRF_PARAMS_PER_CHANNEL];
-        float v2 = crf_params[base + 2 * PPISP_CRF_PARAMS_PER_CHANNEL];
-        float mean = (v0 + v1 + v2) / 3.0f;
-        float values[3] = {v0, v1, v2};
+    for (int idx = tid; idx < total; idx += stride) {
+        if (idx < num_frames) {
+            grad_exposure_params[idx] = frame_grads[0];
+            int base = idx * PPISP_COLOR_PARAMS;
+#pragma unroll
+            for (int i = 0; i < PPISP_COLOR_PARAMS; i++) {
+                grad_color_params[base + i] = frame_grads[1 + i];
+            }
+        }
+
+        if (idx < total_vig) {
+            int param_idx = idx % PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
+            int camera_idx = idx / PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
+            int base = camera_idx * 3 * PPISP_VIGNETTING_PARAMS_PER_CHANNEL + param_idx;
+            float v0 = vignetting_params[base];
+            float v1 = vignetting_params[base + PPISP_VIGNETTING_PARAMS_PER_CHANNEL];
+            float v2 = vignetting_params[base + 2 * PPISP_VIGNETTING_PARAMS_PER_CHANNEL];
+            float mean = (v0 + v1 + v2) / 3.0f;
+            float values[3] = {v0, v1, v2};
 
 #pragma unroll
-        for (int channel = 0; channel < 3; channel++) {
-            float grad = crf_channel_weight * (2.0f / 3.0f) * (values[channel] - mean) *
-                         inv_crf_channel_denom;
-            grad_crf_params[base + channel * PPISP_CRF_PARAMS_PER_CHANNEL] += upstream * grad;
+            for (int channel = 0; channel < 3; channel++) {
+                float val = values[channel];
+                float grad = 0.0f;
+
+                if (vig_center_weight > 0.0f && param_idx < 2) {
+                    grad += vig_center_scale * val;
+                }
+
+                if (vig_non_pos_weight > 0.0f && param_idx >= 2 && val > 0.0f) {
+                    grad += vig_non_pos_scale;
+                }
+
+                if (vig_channel_weight > 0.0f) {
+                    grad += vig_channel_scale * (val - mean);
+                }
+
+                grad_vignetting_params[base + channel * PPISP_VIGNETTING_PARAMS_PER_CHANNEL] = grad;
+            }
+        }
+
+        if (idx < total_crf) {
+            int param_idx = idx % PPISP_CRF_PARAMS_PER_CHANNEL;
+            int camera_idx = idx / PPISP_CRF_PARAMS_PER_CHANNEL;
+            int base = camera_idx * 3 * PPISP_CRF_PARAMS_PER_CHANNEL + param_idx;
+            float v0 = crf_params[base];
+            float v1 = crf_params[base + PPISP_CRF_PARAMS_PER_CHANNEL];
+            float v2 = crf_params[base + 2 * PPISP_CRF_PARAMS_PER_CHANNEL];
+            float mean = (v0 + v1 + v2) / 3.0f;
+            float values[3] = {v0, v1, v2};
+
+#pragma unroll
+            for (int channel = 0; channel < 3; channel++) {
+                float grad = 0.0f;
+                if (crf_channel_weight > 0.0f) {
+                    grad = crf_channel_scale * (values[channel] - mean);
+                }
+                grad_crf_params[base + channel * PPISP_CRF_PARAMS_PER_CHANNEL] = grad;
+            }
         }
     }
 }
@@ -726,13 +718,11 @@ void ppisp_regularization_forward(
 }
 
 // Inputs:
-// - exposure_params: [num_frames]
 // - vignetting_params: [num_cameras, 3, PPISP_VIGNETTING_PARAMS_PER_CHANNEL]
-// - color_params: [num_frames, PPISP_COLOR_PARAMS]
 // - crf_params: [num_cameras, 3, PPISP_CRF_PARAMS_PER_CHANNEL]
 // - grad_loss: scalar upstream gradient
 // - frame_mean_sums: [PPISP_FRAME_MEAN_SUMS_SIZE] output from forward
-// Outputs, expected zero-initialized:
+// Outputs, fully assigned by the kernel:
 // - grad_exposure_params: [num_frames]
 // - grad_vignetting_params: [num_cameras, 3, PPISP_VIGNETTING_PARAMS_PER_CHANNEL]
 // - grad_color_params: [num_frames, PPISP_COLOR_PARAMS]
@@ -740,37 +730,24 @@ void ppisp_regularization_forward(
 // frame_mean_sums layout:
 // [sum(exposure_params), sum(color_offset_0), ..., sum(color_offset_7)].
 void ppisp_regularization_backward(
-    const float *exposure_params, const float *vignetting_params, const float *color_params,
-    const float *crf_params, const float *grad_loss, float *grad_exposure_params,
-    float *grad_vignetting_params, float *grad_color_params, float *grad_crf_params,
-    float *frame_mean_sums, int num_cameras, int num_frames, float exposure_mean_weight,
-    float vig_center_weight, float vig_channel_weight, float vig_non_pos_weight,
-    float color_mean_weight, float crf_channel_weight) {
+    const float *vignetting_params, const float *crf_params, const float *grad_loss,
+    float *grad_exposure_params, float *grad_vignetting_params, float *grad_color_params,
+    float *grad_crf_params, float *frame_mean_sums, int num_cameras, int num_frames,
+    float exposure_mean_weight, float vig_center_weight, float vig_channel_weight,
+    float vig_non_pos_weight, float color_mean_weight, float crf_channel_weight) {
+    // One index per frame, per vignetting slot, and per CRF slot; the kernel
+    // uses the same bound so every output element has an owner.
+    const int work = std::max(num_frames,
+                              num_cameras * std::max(PPISP_VIGNETTING_PARAMS_PER_CHANNEL,
+                                                     PPISP_CRF_PARAMS_PER_CHANNEL));
+    if (work == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
+    const int blocks = divUp(work, threads);
     const auto stream = at::cuda::getCurrentCUDAStream();
-
-    if (num_frames > 0 && (exposure_mean_weight > 0.0f || color_mean_weight > 0.0f)) {
-        int blocks = divUp(num_frames, threads);
-        ppisp_regularization_frame_mean_backward_kernel<<<blocks, threads, 0, stream>>>(
-            frame_mean_sums, grad_loss, grad_exposure_params, grad_color_params, num_frames,
-            exposure_mean_weight, color_mean_weight);
-    }
-
-    if (num_cameras > 0 &&
-        (vig_center_weight > 0.0f || vig_channel_weight > 0.0f || vig_non_pos_weight > 0.0f)) {
-        int total_vig = num_cameras * PPISP_VIGNETTING_PARAMS_PER_CHANNEL;
-        int blocks = divUp(total_vig, threads);
-        ppisp_regularization_vignetting_backward_kernel<<<blocks, threads, 0, stream>>>(
-            vignetting_params, grad_loss, grad_vignetting_params, num_cameras, vig_center_weight,
-            vig_channel_weight, vig_non_pos_weight);
-    }
-
-    if (num_cameras > 0 && crf_channel_weight > 0.0f) {
-        int total_crf = num_cameras * PPISP_CRF_PARAMS_PER_CHANNEL;
-        int blocks = divUp(total_crf, threads);
-        ppisp_regularization_crf_backward_kernel<<<blocks, threads, 0, stream>>>(
-            crf_params, grad_loss, grad_crf_params, num_cameras, crf_channel_weight);
-    }
-
+    ppisp_regularization_backward_kernel<<<blocks, threads, 0, stream>>>(
+        vignetting_params, crf_params, frame_mean_sums, grad_loss, grad_exposure_params,
+        grad_vignetting_params, grad_color_params, grad_crf_params, num_frames, num_cameras,
+        exposure_mean_weight, vig_center_weight, vig_channel_weight, vig_non_pos_weight,
+        color_mean_weight, crf_channel_weight);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

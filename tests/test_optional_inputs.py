@@ -143,5 +143,98 @@ def test_parameter_grads_do_not_share_storage():
         assert g.untyped_storage().nbytes() == g.numel() * g.element_size()
 
 
+def test_mixed_device_inputs_raise():
+    """Inputs off the CUDA device are rejected before any kernel dereferences them."""
+    params = _make_params()
+    rgb = torch.rand(H, W, 3, device="cuda")
+    with pytest.raises(RuntimeError, match="'rgb_in' is on CPU, but expected it to be on GPU"):
+        ppisp.ppisp_apply(**params, rgb_in=rgb.cpu(), pixel_coords=None,
+                          resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
+    params["crf_params"] = params["crf_params"].detach().cpu()
+    with pytest.raises(RuntimeError, match="'crf_params' is on CPU, but expected it to be on GPU"):
+        ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=None,
+                          resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
+
+
+@pytest.mark.parametrize("name,shape,message", [
+    ("vignetting_params", (1, 3, 4),
+     r"Expected tensor of size \[1, 3, 5\], but got tensor of size \[1, 3, 4\] for argument #2 'vignetting_params'"),
+    ("vignetting_params", (1, 15),
+     "Expected 3-dimensional tensor, but got 2-dimensional tensor for argument #2 'vignetting_params'"),
+    ("crf_params", (1, 4, 3),
+     r"Expected tensor of size \[1, 3, 4\], but got tensor of size \[1, 4, 3\] for argument #4 'crf_params'"),
+    ("color_params", (2, 8),
+     r"Expected tensor of size \[1, 8\], but got tensor of size \[2, 8\] for argument #3 'color_params'"),
+    ("exposure_params", (1, 1),
+     "Expected 1-dimensional tensor, but got 2-dimensional tensor for argument #1 'exposure_params'"),
+])
+def test_wrong_parameter_shapes_raise(name, shape, message):
+    """The kernels hard-code the parameter layouts, so the wrapper checks them."""
+    params = _make_params()
+    params[name] = torch.zeros(shape, device="cuda")
+    rgb = torch.rand(H, W, 3, device="cuda")
+    with pytest.raises(RuntimeError, match=message):
+        ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=None,
+                          resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
+
+
+def test_direct_binding_rejects_non_contiguous_and_wrong_dtype():
+    """Callers of the extension itself get an error instead of garbage pixels."""
+    import ppisp_cuda
+
+    params = {k: v.detach() for k, v in _make_params().items()}
+    rgb = torch.rand(3, H * W, device="cuda").t()  # [N, 3] but not contiguous
+    with pytest.raises(RuntimeError, match="non-contiguous tensor for argument #5 'rgb_in'"):
+        ppisp_cuda.ppisp_forward(*params.values(), rgb, None, W, H, 0, 0)
+    with pytest.raises(RuntimeError, match="argument #5 'rgb_in' to have scalar type Float"):
+        ppisp_cuda.ppisp_forward(*params.values(), rgb.contiguous().double(), None, W, H, 0, 0)
+
+
+def test_misaligned_color_params_view_matches_aligned():
+    """A color slice at an odd float offset in a flat buffer is copied, not faulted."""
+    aligned = _make_params()
+    flat = torch.zeros(1 + 8, device="cuda", requires_grad=True)  # exposure then color
+    with torch.no_grad():
+        flat[1:].view(1, 8).copy_(aligned["color_params"])
+    misaligned = dict(aligned)
+    misaligned["color_params"] = flat[1:].view(1, 8)
+    assert misaligned["color_params"].is_contiguous()
+    assert misaligned["color_params"].data_ptr() % 8 == 4
+
+    rgb = (torch.rand(H, W, 3, device="cuda") * 0.6 + 0.2)
+    kwargs = dict(rgb_in=rgb, pixel_coords=None, resolution_w=W, resolution_h=H,
+                  camera_idx=0, frame_idx=0)
+    out_aligned = ppisp.ppisp_apply(**aligned, **kwargs)
+    out_misaligned = ppisp.ppisp_apply(**misaligned, **kwargs)
+    torch.testing.assert_close(out_misaligned, out_aligned, rtol=0, atol=0)
+    out_aligned.sum().backward()
+    out_misaligned.sum().backward()
+    torch.testing.assert_close(flat.grad[1:].view(1, 8), aligned["color_params"].grad,
+                               rtol=1e-5, atol=1e-6)
+    assert flat.grad[0] == 0
+
+
+def test_pixel_coords_device_ignored_when_camera_disabled():
+    """camera_idx=None drops pixel_coords before the extension, so any device works."""
+    params = _make_params()
+    rgb = (torch.rand(H, W, 3, device="cuda") * 0.6 + 0.2).requires_grad_(True)
+    coords_cpu = _make_pixel_centers(H, W, device="cpu")
+    out = ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=coords_cpu,
+                            resolution_w=W, resolution_h=H, camera_idx=None, frame_idx=0)
+    out.sum().backward()
+    assert torch.isfinite(rgb.grad).all()
+
+
+@pytest.mark.parametrize("camera_idx,frame_idx", [(1, 0), (-2, 0), (0, 1), (0, -2)])
+def test_out_of_range_indices_raise_index_error(camera_idx, frame_idx):
+    """Indices outside the parameter tensors are rejected before any kernel runs."""
+    params = _make_params()
+    rgb = torch.rand(H, W, 3, device="cuda")
+    with pytest.raises(IndexError, match="out of range"):
+        ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=None,
+                          resolution_w=W, resolution_h=H,
+                          camera_idx=camera_idx, frame_idx=frame_idx)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

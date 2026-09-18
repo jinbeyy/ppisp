@@ -200,19 +200,18 @@ class _PPISPFunction(torch.autograd.Function):
         camera_idx: int,
         frame_idx: int,
     ) -> torch.Tensor:
-        with torch.cuda.device(rgb_in.device):
-            rgb_out = _C.ppisp_forward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                rgb_in,
-                pixel_coords,
-                resolution_w,
-                resolution_h,
-                camera_idx,
-                frame_idx,
-            )
+        rgb_out = _C.ppisp_forward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            rgb_in,
+            pixel_coords,
+            resolution_w,
+            resolution_h,
+            camera_idx,
+            frame_idx,
+        )
 
         # The backward recomputes the pipeline from rgb_in, so rgb_out is not saved.
         ctx.save_for_backward(
@@ -231,21 +230,20 @@ class _PPISPFunction(torch.autograd.Function):
         (exposure_params, vignetting_params,
          color_params, crf_params, rgb_in, pixel_coords) = ctx.saved_tensors
 
-        with torch.cuda.device(rgb_in.device):
-            (v_exposure_params, v_vignetting_params,
-             v_color_params, v_crf_params, v_rgb_in) = _C.ppisp_backward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                rgb_in,
-                pixel_coords,
-                v_rgb_out.contiguous(),
-                ctx.resolution_w,
-                ctx.resolution_h,
-                ctx.camera_idx,
-                ctx.frame_idx,
-            )
+        (v_exposure_params, v_vignetting_params,
+         v_color_params, v_crf_params, v_rgb_in) = _C.ppisp_backward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            rgb_in,
+            pixel_coords,
+            v_rgb_out.contiguous(),
+            ctx.resolution_w,
+            ctx.resolution_h,
+            ctx.camera_idx,
+            ctx.frame_idx,
+        )
 
         return (
             v_exposure_params,
@@ -292,14 +290,13 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
             float(crf_channel_weight),
         )
 
-        with torch.cuda.device(exposure_params.device):
-            loss, frame_mean_sums = _C.ppisp_regularization_forward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                *weights,
-            )
+        loss, frame_mean_sums = _C.ppisp_regularization_forward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            *weights,
+        )
 
         ctx.save_for_backward(
             exposure_params, vignetting_params, color_params, crf_params, frame_mean_sums
@@ -313,16 +310,15 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        with torch.cuda.device(exposure_params.device):
-            grads = _C.ppisp_regularization_backward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                v_loss.contiguous(),
-                frame_mean_sums,
-                *ctx.weights,
-            )
+        grads = _C.ppisp_regularization_backward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            v_loss.contiguous(),
+            frame_mean_sums,
+            *ctx.weights,
+        )
 
         return grads + (None,) * 6
 
@@ -355,7 +351,9 @@ def ppisp_apply(
         color_params: Per-frame color correction [num_frames, 8]
         crf_params: Per-camera CRF [num_cameras, 3, 4]
         rgb_in: Input RGB [H, W, 3] or [N, 3]
-        pixel_coords: Pixel coordinates [H, W, 2], [N, 2], or None.
+        pixel_coords: Pixel coordinates [H, W, 2], [N, 2], or None. Ignored when
+            camera_idx is None. When None with a camera, pixel centers are derived
+            from the resolution.
         resolution_w: Image width
         resolution_h: Image height
         camera_idx: Camera index (Tensor, int, or None). None disables per-camera effects.
@@ -374,7 +372,11 @@ def ppisp_apply(
     # Flatten tensors for processing and assert correct dimensions
     rgb_flat = rgb_in.view(-1, rgb_in.shape[-1])
     assert rgb_flat.shape[-1] == 3, f"Expected 3 RGB channels, got {rgb_flat.shape[-1]}"
-    if pixel_coords is None:
+    if camera_idx == -1:
+        # Only the per-camera effects read coordinates; drop them so they are
+        # neither converted nor saved for the backward.
+        coords_flat = None
+    elif pixel_coords is None:
         coords_flat = None
         assert rgb_flat.shape[0] == resolution_w * resolution_h, (
             f"resolution must be consistent with num_pixels in rgb, "

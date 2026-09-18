@@ -49,8 +49,8 @@ void ppisp_backward(
     // Parameters (per-camera/per-frame)
     const float *exposure_params, const float *vignetting_params, const float *color_params,
     const float *crf_params,
-    // Input/Output from forward
-    const float *rgb_in, const float *rgb_out, const float *pixel_coords,
+    // Input from forward
+    const float *rgb_in, const float *pixel_coords,
     // Gradient of loss w.r.t. output
     const float *v_rgb_out,
     // Gradients w.r.t. parameters
@@ -136,7 +136,7 @@ torch::Tensor ppisp_forward_tensor(torch::Tensor exposure_params,    // [num_fra
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 ppisp_backward_tensor(torch::Tensor exposure_params, torch::Tensor vignetting_params,
                       torch::Tensor color_params, torch::Tensor crf_params, torch::Tensor rgb_in,
-                      torch::Tensor rgb_out, c10::optional<torch::Tensor> pixel_coords,
+                      c10::optional<torch::Tensor> pixel_coords,
                       torch::Tensor v_rgb_out, int resolution_w, int resolution_h, int camera_idx,
                       int frame_idx) {
     // Kernels index pixels with int and the backward's grid-stride loop runs past
@@ -155,7 +155,7 @@ ppisp_backward_tensor(torch::Tensor exposure_params, torch::Tensor vignetting_pa
 
     ppisp_backward(exposure_params.data_ptr<float>(), vignetting_params.data_ptr<float>(),
                    color_params.data_ptr<float>(), crf_params.data_ptr<float>(),
-                   rgb_in.data_ptr<float>(), rgb_out.data_ptr<float>(),
+                   rgb_in.data_ptr<float>(),
                    pixel_coords.has_value() ? pixel_coords->data_ptr<float>() : nullptr,
                    v_rgb_out.data_ptr<float>(), v_exposure_params.data_ptr<float>(),
                    v_vignetting_params.data_ptr<float>(), v_color_params.data_ptr<float>(),

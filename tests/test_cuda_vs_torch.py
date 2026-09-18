@@ -140,7 +140,7 @@ class CUDAAutograd(torch.autograd.Function):
 
         ctx.save_for_backward(
             exposure_params, vignetting_params,
-            color_params, crf_params, rgb_in, rgb_out, pixel_coords
+            color_params, crf_params, rgb_in, pixel_coords
         )
         ctx.resolution_w = resolution_w
         ctx.resolution_h = resolution_h
@@ -152,11 +152,11 @@ class CUDAAutograd(torch.autograd.Function):
     @staticmethod
     def backward(ctx, v_rgb_out):
         (exposure_params, vignetting_params,
-         color_params, crf_params, rgb_in, rgb_out, pixel_coords) = ctx.saved_tensors
+         color_params, crf_params, rgb_in, pixel_coords) = ctx.saved_tensors
 
         grads = ppisp_cuda.ppisp_backward(
             exposure_params, vignetting_params,
-            color_params, crf_params, rgb_in, rgb_out, pixel_coords,
+            color_params, crf_params, rgb_in, pixel_coords,
             v_rgb_out.contiguous(),
             ctx.resolution_w, ctx.resolution_h,
             ctx.camera_idx, ctx.frame_idx,

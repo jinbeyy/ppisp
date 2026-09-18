@@ -214,9 +214,10 @@ class _PPISPFunction(torch.autograd.Function):
                 frame_idx,
             )
 
+        # The backward recomputes the pipeline from rgb_in, so rgb_out is not saved.
         ctx.save_for_backward(
             exposure_params, vignetting_params,
-            color_params, crf_params, rgb_in, rgb_out, pixel_coords
+            color_params, crf_params, rgb_in, pixel_coords
         )
         ctx.resolution_w = resolution_w
         ctx.resolution_h = resolution_h
@@ -228,7 +229,7 @@ class _PPISPFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, v_rgb_out: torch.Tensor):
         (exposure_params, vignetting_params,
-         color_params, crf_params, rgb_in, rgb_out, pixel_coords) = ctx.saved_tensors
+         color_params, crf_params, rgb_in, pixel_coords) = ctx.saved_tensors
 
         with torch.cuda.device(rgb_in.device):
             (v_exposure_params, v_vignetting_params,
@@ -238,7 +239,6 @@ class _PPISPFunction(torch.autograd.Function):
                 color_params,
                 crf_params,
                 rgb_in,
-                rgb_out,
                 pixel_coords,
                 v_rgb_out.contiguous(),
                 ctx.resolution_w,

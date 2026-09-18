@@ -177,8 +177,9 @@ std::tuple<torch::Tensor, torch::Tensor> ppisp_regularization_forward_tensor(
     int num_cameras = crf_params.size(0);
     int num_frames = exposure_params.size(0);
 
-    auto loss = torch::zeros({}, exposure_params.options());
-    auto frame_mean_sums = torch::zeros({PPISP_FRAME_MEAN_SUMS_SIZE}, exposure_params.options());
+    // Both outputs are fully written by the kernel, including for empty inputs.
+    auto loss = torch::empty({}, exposure_params.options());
+    auto frame_mean_sums = torch::empty({PPISP_FRAME_MEAN_SUMS_SIZE}, exposure_params.options());
 
     ppisp_regularization_forward(
         exposure_params.data_ptr<float>(), vignetting_params.data_ptr<float>(),

@@ -541,14 +541,14 @@ def test_regularization_loss_channel_equal_variance_terms_are_zero():
     )
 
 
-def test_regularization_loss_large_multiblock_reduction_matches_torch_reference():
+def test_regularization_loss_large_grid_stride_reduction_matches_torch_reference():
     module_cuda = _make_module(seed=123, num_cameras=19, num_frames=513)
     module_torch = _make_module(seed=124, num_cameras=19, num_frames=513)
     _clone_params(module_cuda, module_torch)
 
-    # The CUDA path uses cross-block atomicAdd reductions. The exact summation
-    # order is not guaranteed, so this intentionally uses looser tolerances
-    # than the small single-block-style cases above.
+    # The CUDA path grid-strides over the inputs and reduces with warp shuffles,
+    # so the summation order differs from the PyTorch reference. This
+    # intentionally uses looser tolerances than the small cases above.
     _assert_loss_and_grads_match(
         module_cuda,
         module_torch,
@@ -685,3 +685,36 @@ def test_regularization_obeys_non_default_stream():
     torch.testing.assert_close(observed, expected, atol=2e-5, rtol=1e-5)
     for actual, parameter in zip(observed_grads, reference.parameters()):
         torch.testing.assert_close(actual, parameter.grad, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("mask", range(64))
+@pytest.mark.parametrize("disabled_weight", [0.0, -0.5])
+def test_regularization_forward_weight_combinations(mask, disabled_weight):
+    names = ("exposure_mean", "vig_center", "vig_channel", "vig_non_pos", "color_mean", "crf_channel")
+    cfg = _make_config(**{name: 0.7 if mask & (1 << i) else disabled_weight for i, name in enumerate(names)})
+    module = _make_module(seed=901, num_cameras=32, num_frames=513, config=cfg)
+    loss, stats = ppisp_cuda.ppisp_regularization_forward(
+        module.exposure_params, module.vignetting_params, module.color_params,
+        module.crf_params, *_weights(cfg),
+    )
+    expected = _regularization_loss_torch(module)
+    torch.testing.assert_close(loss, expected, atol=2e-5, rtol=1e-5)
+    expected_stats = torch.zeros_like(stats)
+    if cfg.exposure_mean > 0:
+        expected_stats[0] = module.exposure_params.sum()
+    if cfg.color_mean > 0:
+        expected_stats[1:] = (module.color_params @ module.color_pinv_block_diag).sum(dim=0)
+    torch.testing.assert_close(stats, expected_stats, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("frames,cameras", [(0, 0), (0, 8), (257, 0), (255, 8), (256, 8), (257, 8)])
+def test_regularization_forward_empty_and_boundary(frames, cameras):
+    module = _make_module(seed=911, num_cameras=cameras, num_frames=frames)
+    cfg = module.config
+    if frames == 0:
+        cfg = replace(cfg, exposure_mean=0.0, color_mean=0.0)
+    if cameras == 0:
+        cfg = replace(cfg, vig_center=0.0, vig_channel=0.0, vig_non_pos=0.0, crf_channel=0.0)
+    reference = _make_module(seed=911, num_cameras=cameras, num_frames=frames, config=cfg)
+    torch.testing.assert_close(module.get_regularization_loss(), _regularization_loss_torch(reference),
+                               atol=2e-5, rtol=1e-5)

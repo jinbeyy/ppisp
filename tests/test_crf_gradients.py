@@ -20,7 +20,7 @@ import math
 import pytest
 import torch
 
-from tests.torch_reference import ppisp_apply_torch
+from tests.torch_reference import _PowDeadZone, ppisp_apply_torch
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -34,6 +34,10 @@ def crf_apply(request):
 
         backend = ppisp_apply
 
+    return _crf_only(backend, device), device
+
+
+def _crf_only(backend, device):
     exposure = torch.zeros(1, device=device)
     vignetting = torch.zeros(1, 3, 5, device=device)
     color = torch.zeros(1, 8, device=device)
@@ -43,7 +47,7 @@ def crf_apply(request):
         # Disable frame effects and use the optical center to isolate the CRF.
         return backend(exposure, vignetting, color, crf, rgb, coords, 1, 1, 0, -1)
 
-    return apply, device
+    return apply
 
 
 def _crf_params(toe, gamma, device):
@@ -97,7 +101,6 @@ def test_crf_endpoints_have_finite_zero_gradients(crf_apply, value):
 def test_reference_dead_zone_matches_cuda_constant():
     """The reference mirrors the kernel's dead zone; the extension exports the value."""
     ppisp_cuda = pytest.importorskip("ppisp_cuda")
-    from tests.torch_reference import _PowDeadZone
 
     as_float32 = torch.tensor(_PowDeadZone.EPS, dtype=torch.float32).item()
     assert as_float32 == ppisp_cuda.CRF_BASE_GRAD_EPS
@@ -128,3 +131,58 @@ def test_crf_near_black_gradients_match_exact_model(crf_apply, toe, gamma, value
     ref.sum().backward()
     torch.testing.assert_close(out.double()[0].cpu(), ref.expand(3), rtol=1e-4, atol=0)
     torch.testing.assert_close(rgb.grad.double()[0].cpu(), x.grad.expand(3), rtol=1e-3, atol=0)
+
+
+def _dead_zone_cases():
+    """CRF inputs whose normalized base straddles the dead zone, as (x, active)."""
+    eps = torch.tensor(_PowDeadZone.EPS, dtype=torch.float32)  # CRF_BASE_GRAD_EPS
+    below = torch.nextafter(eps, torch.tensor(0.0)).item()
+    above = torch.nextafter(eps, torch.tensor(1.0)).item()
+    # Toe end: base = x / 0.5 is exact, so the base lands on and beside EPS.
+    cases = [(base * 0.5, base > eps.item()) for base in (below, eps.item(), above)]
+    # Shoulder end: 1 - x steps by 2**-24 just below 1, so base = (1 - x) / 0.5
+    # steps by 2**-23 and cannot equal EPS; take the neighbours on either side.
+    k = math.floor(eps.item() / 2**-23)
+    cases += [(1.0 - k * 2**-24, False), (1.0 - (k + 1) * 2**-24, True)]
+    return cases
+
+
+@pytest.mark.parametrize("value,active", _dead_zone_cases())
+def test_crf_dead_zone_transition(crf_apply, value, active):
+    """rgb gradients are zero up to and at EPS and match the exact model above it."""
+    apply, device = crf_apply
+    # toe=5, gamma=0.2 and shoulder=1 keep the exact slope finite at both endpoints.
+    crf = _crf_params(5.0, 0.2, device)
+    rgb = torch.full((1, 3), value, device=device, requires_grad=True)
+    out = apply(rgb, crf)
+    out.sum().backward()
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(crf.grad).all()
+    if not active:
+        torch.testing.assert_close(rgb.grad, torch.zeros_like(rgb), rtol=0, atol=0)
+        return
+    x = torch.tensor([value], dtype=torch.float64, requires_grad=True)
+    params = [torch.tensor(v, dtype=torch.float64) for v in (5.0, 1.0, 0.2, 0.5)]
+    _exact_crf_fp64(x, *params).sum().backward()
+    assert x.grad.item() > 0
+    torch.testing.assert_close(rgb.grad.double()[0].cpu(), x.grad.expand(3), rtol=1e-3, atol=0)
+
+
+@pytest.mark.parametrize("value,active", _dead_zone_cases())
+def test_crf_dead_zone_cuda_matches_reference(value, active):
+    """Output and every gradient agree between the CUDA kernel and the reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU unavailable")
+    from ppisp import ppisp_apply
+
+    results = []
+    for device, backend in (("cpu", ppisp_apply_torch), ("cuda", ppisp_apply)):
+        crf = _crf_params(5.0, 0.2, device)
+        rgb = torch.full((1, 3), value, device=device, requires_grad=True)
+        out = _crf_only(backend, device)(rgb, crf)
+        out.sum().backward()
+        results.append([t.detach().cpu() for t in (out, rgb.grad, crf.grad)])
+    (ref_out, ref_rgb, ref_crf), (cuda_out, cuda_rgb, cuda_crf) = results
+    torch.testing.assert_close(cuda_out, ref_out, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(cuda_rgb, ref_rgb, rtol=1e-3, atol=0)
+    torch.testing.assert_close(cuda_crf, ref_crf, rtol=1e-3, atol=1e-6)

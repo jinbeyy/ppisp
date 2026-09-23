@@ -46,6 +46,15 @@ def _make_params(seed: int = 42):
 H, W = 32, 48
 
 
+@pytest.fixture
+def validate_inputs():
+    """Enable the opt-in extension input checks for one test."""
+    previous = ppisp.validate_inputs_enabled()
+    ppisp.set_validate_inputs(True)
+    yield
+    ppisp.set_validate_inputs(previous)
+
+
 def test_pixel_coords_none_matches_explicit():
     """Omitting pixel_coords should match explicit pixel-center coords."""
     params = _make_params()
@@ -143,8 +152,13 @@ def test_parameter_grads_do_not_share_storage():
         assert g.untyped_storage().nbytes() == g.numel() * g.element_size()
 
 
+def test_input_validation_is_off_by_default():
+    assert not ppisp.validate_inputs_enabled()
+
+
+@pytest.mark.usefixtures("validate_inputs")
 def test_mixed_device_inputs_raise():
-    """Inputs off the CUDA device are rejected before any kernel dereferences them."""
+    """With validation on, inputs off the CUDA device are rejected before any kernel runs."""
     params = _make_params()
     rgb = torch.rand(H, W, 3, device="cuda")
     with pytest.raises(RuntimeError, match="'rgb_in' is on CPU, but expected it to be on GPU"):
@@ -168,8 +182,9 @@ def test_mixed_device_inputs_raise():
     ("exposure_params", (1, 1),
      "Expected 1-dimensional tensor, but got 2-dimensional tensor for argument #1 'exposure_params'"),
 ])
+@pytest.mark.usefixtures("validate_inputs")
 def test_wrong_parameter_shapes_raise(name, shape, message):
-    """The kernels hard-code the parameter layouts, so the wrapper checks them."""
+    """The kernels hard-code the parameter layouts, so validation checks them."""
     params = _make_params()
     params[name] = torch.zeros(shape, device="cuda")
     rgb = torch.rand(H, W, 3, device="cuda")
@@ -178,8 +193,9 @@ def test_wrong_parameter_shapes_raise(name, shape, message):
                           resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
 
 
+@pytest.mark.usefixtures("validate_inputs")
 def test_direct_binding_rejects_non_contiguous_and_wrong_dtype():
-    """Callers of the extension itself get an error instead of garbage pixels."""
+    """With validation on, callers of the extension itself get an error, not garbage pixels."""
     import ppisp_cuda
 
     params = {k: v.detach() for k, v in _make_params().items()}
@@ -256,14 +272,35 @@ def test_pixel_coords_device_ignored_when_camera_disabled():
 
 
 @pytest.mark.parametrize("camera_idx,frame_idx", [(1, 0), (-2, 0), (0, 1), (0, -2)])
+@pytest.mark.usefixtures("validate_inputs")
 def test_out_of_range_indices_raise_index_error(camera_idx, frame_idx):
-    """Indices outside the parameter tensors are rejected before any kernel runs."""
+    """With validation on, indices outside the parameters are rejected before any kernel runs."""
     params = _make_params()
     rgb = torch.rand(H, W, 3, device="cuda")
     with pytest.raises(IndexError, match="out of range"):
         ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=None,
                           resolution_w=W, resolution_h=H,
                           camera_idx=camera_idx, frame_idx=frame_idx)
+
+
+@pytest.mark.usefixtures("validate_inputs")
+def test_regularization_binding_rejects_malformed_inputs():
+    """With validation on, the regularization wrappers check parameters and saved tensors too."""
+    import ppisp_cuda
+
+    params = {k: v.detach() for k, v in _make_params().items()}
+    weights = [1.0] * 6
+    bad = dict(params, crf_params=torch.zeros(1, 4, 3, device="cuda"))
+    with pytest.raises(RuntimeError, match="argument #4 'crf_params'"):
+        ppisp_cuda.ppisp_regularization_forward(*bad.values(), *weights)
+    _, frame_mean_sums = ppisp_cuda.ppisp_regularization_forward(*params.values(), *weights)
+    grad_loss = torch.ones((), device="cuda")
+    with pytest.raises(RuntimeError, match="'grad_loss' is on CPU"):
+        ppisp_cuda.ppisp_regularization_backward(*params.values(), grad_loss.cpu(),
+                                                 frame_mean_sums, *weights)
+    with pytest.raises(RuntimeError, match="argument #6 'frame_mean_sums'"):
+        ppisp_cuda.ppisp_regularization_backward(*params.values(), grad_loss,
+                                                 frame_mean_sums[:-1], *weights)
 
 
 if __name__ == "__main__":

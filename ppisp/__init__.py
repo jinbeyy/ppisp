@@ -59,6 +59,21 @@ _COLOR_PINV_BLOCK_DIAG = torch.block_diag(
 NUM_VIGNETTING_ALPHA_TERMS = 3
 
 
+def set_validate_inputs(enabled: bool) -> None:
+    """Enable or disable input validation in the CUDA extension wrappers.
+
+    Off by default. When enabled, every extension call checks device, dtype,
+    shape, contiguity, and camera/frame indices and raises on malformed inputs,
+    which otherwise reach the kernels unchecked. Useful when debugging.
+    """
+    _C.set_validate_inputs(enabled)
+
+
+def validate_inputs_enabled() -> bool:
+    """Return whether the CUDA extension wrappers validate their inputs."""
+    return _C.validate_inputs_enabled()
+
+
 def _normalize_index(idx: torch.Tensor | int | None, name: str) -> int:
     """Normalize camera/frame index to int.
 

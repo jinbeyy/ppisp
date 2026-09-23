@@ -22,10 +22,10 @@
 #include <array>
 #include <atomic>
 
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAMacros.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "ppisp_constants.h"
 #include "ppisp_math.cuh"
@@ -320,7 +320,7 @@ void ppisp_forward(const float *exposure_params, const float *vignetting_params,
     if (num_pixels == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
     const int blocks = divUp(num_pixels, threads);
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
 
     ppisp_kernel<<<blocks, threads, 0, stream>>>(
         num_pixels, num_cameras, num_frames, exposure_params,
@@ -372,7 +372,7 @@ void ppisp_backward(const float *exposure_params, const float *vignetting_params
     // No more blocks than can be resident at once: the grid-stride loop absorbs
     // the rest, so no partial wave of blocks trails the launch.
     const int blocks = std::min(divUp(num_pixels, threads), ppisp_bwd_resident_blocks());
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
 
     ppisp_bwd_kernel<PPISP_BLOCK_SIZE><<<blocks, threads, 0, stream>>>(
         num_pixels, num_cameras, num_frames, exposure_params,
@@ -707,7 +707,7 @@ void ppisp_regularization_forward(
     int num_frames, float exposure_mean_weight, float vig_center_weight,
     float vig_channel_weight, float vig_non_pos_weight, float color_mean_weight,
     float crf_channel_weight) {
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
     ppisp_regularization_forward_kernel<PPISP_REG_BLOCK_SIZE>
         <<<1, PPISP_REG_BLOCK_SIZE, 0, stream>>>(
             exposure_params, reinterpret_cast<const ColorPPISPParams *>(color_params),
@@ -743,7 +743,7 @@ void ppisp_regularization_backward(
     if (work == 0) return;
     const int threads = PPISP_BLOCK_SIZE;
     const int blocks = divUp(work, threads);
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
     ppisp_regularization_backward_kernel<<<blocks, threads, 0, stream>>>(
         vignetting_params, crf_params, frame_mean_sums, grad_loss, grad_exposure_params,
         grad_vignetting_params, grad_color_params, grad_crf_params, num_frames, num_cameras,

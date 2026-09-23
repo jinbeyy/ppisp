@@ -271,6 +271,19 @@ def _as_float_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.float().contiguous()
 
 
+def _as_float2_aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """``_as_float_contiguous`` plus the 8-byte alignment of the kernels' float2 loads.
+
+    The extension also copies a misaligned view, but only for its own call;
+    copying here once lets the forward, the backward and the saved tensor share
+    the aligned copy.
+    """
+    tensor = _as_float_contiguous(tensor)
+    if tensor.data_ptr() % 8 != 0:
+        return tensor.clone()
+    return tensor
+
+
 class _PPISPRegularizationFunction(torch.autograd.Function):
     """Custom autograd function for the PPISP regularization loss.
 
@@ -400,11 +413,11 @@ def ppisp_apply(
     # Convert to float32 and ensure contiguous memory layout
     exposure_params = _as_float_contiguous(exposure_params)
     vignetting_params = _as_float_contiguous(vignetting_params)
-    color_params = _as_float_contiguous(color_params)
+    color_params = _as_float2_aligned(color_params)
     crf_params = _as_float_contiguous(crf_params)
     rgb_flat = _as_float_contiguous(rgb_flat)
     if coords_flat is not None:
-        coords_flat = _as_float_contiguous(coords_flat)
+        coords_flat = _as_float2_aligned(coords_flat)
 
     rgb_out = _PPISPFunction.apply(
         exposure_params,

@@ -160,14 +160,15 @@ inline void ppisp_check_indices(int camera_idx, int64_t num_cameras, int frame_i
 }
 
 // The kernels load color_params as ColorPPISPParams, whose float2 members need
-// 8-byte alignment. A contiguous view at an odd float offset, such as a slice
-// of a flat parameter buffer, is copied into an aligned allocation.
-inline torch::Tensor ppisp_float2_aligned(torch::Tensor color_params) {
+// 8-byte alignment, and pixel_coords as float2. A contiguous view at an odd
+// float offset, such as a slice of a flat buffer, is copied into an aligned
+// allocation.
+inline torch::Tensor ppisp_float2_aligned(torch::Tensor tensor) {
     constexpr uintptr_t kFloat2Align = 2 * sizeof(float);
-    if (reinterpret_cast<uintptr_t>(color_params.data_ptr()) % kFloat2Align != 0) {
-        return color_params.clone();
+    if (reinterpret_cast<uintptr_t>(tensor.data_ptr()) % kFloat2Align != 0) {
+        return tensor.clone();
     }
-    return color_params;
+    return tensor;
 }
 
 // Validation shared by the image forward and backward: parameters, the pixel
@@ -218,6 +219,9 @@ torch::Tensor ppisp_forward_tensor(torch::Tensor exposure_params,    // [num_fra
     // launch target it, without a Python-side context manager.
     const c10::cuda::CUDAGuard device_guard(rgb_in.device());
     color_params = ppisp_float2_aligned(color_params);
+    if (pixel_coords.has_value()) {
+        pixel_coords = ppisp_float2_aligned(*pixel_coords);
+    }
     int num_pixels = ppisp_checked_num_pixels(rgb_in);
     int num_cameras = counts.first;
     int num_frames = counts.second;
@@ -244,6 +248,9 @@ ppisp_backward_tensor(torch::Tensor exposure_params, torch::Tensor vignetting_pa
         pixel_coords, &v_rgb_out, camera_idx, frame_idx);
     const c10::cuda::CUDAGuard device_guard(rgb_in.device());
     color_params = ppisp_float2_aligned(color_params);
+    if (pixel_coords.has_value()) {
+        pixel_coords = ppisp_float2_aligned(*pixel_coords);
+    }
     int num_pixels = ppisp_checked_num_pixels(rgb_in);
     int num_cameras = counts.first;
     int num_frames = counts.second;

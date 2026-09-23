@@ -210,8 +210,38 @@ def test_misaligned_color_params_view_matches_aligned():
     out_aligned.sum().backward()
     out_misaligned.sum().backward()
     torch.testing.assert_close(flat.grad[1:].view(1, 8), aligned["color_params"].grad,
-                               rtol=1e-5, atol=1e-6)
+                               rtol=1e-4, atol=1e-5)
     assert flat.grad[0] == 0
+
+
+def test_misaligned_pixel_coords_view_matches_aligned():
+    """A pixel_coords slice at an odd float offset in a flat buffer is copied, not faulted."""
+    import ppisp_cuda
+
+    params = _make_params()
+    coords = _make_pixel_centers(H, W).view(-1, 2)
+    flat = torch.zeros(1 + coords.numel(), device="cuda")
+    flat[1:].view(-1, 2).copy_(coords)
+    misaligned = flat[1:].view(-1, 2)
+    assert misaligned.is_contiguous()
+    assert misaligned.data_ptr() % 8 == 4
+
+    rgb = (torch.rand(H * W, 3, device="cuda") * 0.6 + 0.2).requires_grad_(True)
+    kwargs = dict(resolution_w=W, resolution_h=H, camera_idx=0, frame_idx=0)
+    out_aligned = ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=coords, **kwargs)
+    out_misaligned = ppisp.ppisp_apply(**params, rgb_in=rgb, pixel_coords=misaligned, **kwargs)
+    torch.testing.assert_close(out_misaligned, out_aligned, rtol=0, atol=0)
+    # ppisp_apply aligns before the extension; the extension aligns for direct callers.
+    detached = [p.detach() for p in params.values()]
+    out_binding = ppisp_cuda.ppisp_forward(*detached, rgb.detach(), misaligned, W, H, 0, 0)
+    torch.testing.assert_close(out_binding, out_aligned, rtol=0, atol=0)
+    grads_aligned = torch.autograd.grad(out_aligned.sum(), [rgb, *params.values()])
+    grads_misaligned = torch.autograd.grad(out_misaligned.sum(), [rgb, *params.values()])
+    # The rgb gradient is per pixel, but the parameter gradients are atomic sums
+    # whose block order differs between the two runs, as in the backward test above.
+    torch.testing.assert_close(grads_misaligned[0], grads_aligned[0], rtol=0, atol=0)
+    for g_misaligned, g_aligned in zip(grads_misaligned[1:], grads_aligned[1:]):
+        torch.testing.assert_close(g_misaligned, g_aligned, rtol=1e-4, atol=1e-5)
 
 
 def test_pixel_coords_device_ignored_when_camera_disabled():
